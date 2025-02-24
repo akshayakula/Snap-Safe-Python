@@ -32,8 +32,7 @@ class Face:
     kps: List[float] = field(default_factory=list)
     bbox: List[float] = field(default_factory=list)
     embedding: List[float] = field(default_factory=list)
-    age: Optional[int] = None
-    gender: Optional[int] = None
+    name: Optional[str] = None
 
     @property
     def sex(self) -> Optional[str]:
@@ -220,5 +219,6 @@ def draw_face_info(frame: np.ndarray, face: Face) -> None:
         face (Face): Face cooridnates, keypoints and attributes
     """
     draw_corners(frame, face.bbox)
-    put_text(frame, f"{face.sex} {face.age}", face.bbox)
+    if face.name:
+        put_text(frame, f"{face.name}", face.bbox)
     draw_keypoints(frame, face.kps)

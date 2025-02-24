@@ -1,0 +1,232 @@
+# ---------------------------------------------------------------------
+# Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+# ---------------------------------------------------------------------
+from __future__ import annotations
+
+import os
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Generic, Optional, TypeVar
+
+import ruamel.yaml
+
+from qai_hub_models.models.common import TargetRuntime
+from qai_hub_models.scorecard.device import ScorecardDevice, cs_universal
+from qai_hub_models.scorecard.execution_helpers import (
+    for_each_scorecard_path_and_device,
+    get_async_job_cache_name,
+)
+from qai_hub_models.scorecard.path_compile import ScorecardCompilePath
+from qai_hub_models.scorecard.path_profile import ScorecardProfilePath
+from qai_hub_models.scorecard.results.performance_summary import (
+    ModelCompileSummary,
+    ModelInferenceSummary,
+    ModelPerfSummary,
+    ModelSummaryTypeVar,
+)
+from qai_hub_models.scorecard.results.scorecard_job import (
+    CompileScorecardJob,
+    InferenceScorecardJob,
+    ProfileScorecardJob,
+    ScorecardJobTypeVar,
+    ScorecardPathTypeVar,
+)
+from qai_hub_models.utils.path_helpers import QAIHM_PACKAGE_ROOT
+
+INTERMEDIATES_DIR = QAIHM_PACKAGE_ROOT / "scorecard" / "intermediates"
+COMPILE_YAML_BASE = INTERMEDIATES_DIR / "compile-jobs.yaml"
+PROFILE_YAML_BASE = INTERMEDIATES_DIR / "profile-jobs.yaml"
+INFERENCE_YAML_BASE = INTERMEDIATES_DIR / "inference-jobs.yaml"
+ScorecardJobYamlTypeVar = TypeVar("ScorecardJobYamlTypeVar", bound="ScorecardJobYaml")
+
+
+class ScorecardJobYaml(
+    Generic[ScorecardJobTypeVar, ScorecardPathTypeVar, ModelSummaryTypeVar]
+):
+    scorecard_job_type: type[ScorecardJobTypeVar]
+    scorecard_path_type: type[ScorecardPathTypeVar]
+    scorecard_model_summary_type: type[ModelSummaryTypeVar]
+
+    def __init__(self, job_id_mapping: dict[str, str] | None = None):
+        self.job_id_mapping = job_id_mapping or dict()
+
+    @classmethod
+    def from_file(
+        cls: type[ScorecardJobYamlTypeVar], config_path: str | Path
+    ) -> ScorecardJobYamlTypeVar:
+        """Read yaml files."""
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"File not found with job ids at {config_path}")
+
+        yaml = ruamel.yaml.YAML()
+        with open(config_path) as file:
+            return cls(yaml.load(file))
+
+    def to_file(self, path: str | Path) -> None:
+        yaml = ruamel.yaml.YAML()
+        with open(path, "w") as file:
+            yaml.dump(self.job_id_mapping, file)
+
+    def get_job_id(
+        self,
+        path: ScorecardPathTypeVar | TargetRuntime,
+        model_id: str,
+        device: ScorecardDevice,
+        component: Optional[str] = None,
+        fallback_to_universal_device: bool = False,
+    ) -> str | None:
+        """
+        Get the ID of this job in the YAML that stores asyncronously-ran scorecard jobs.
+        Returns None if job does not exist.
+
+        parameters:
+            path: Applicable scorecard path
+            model_id: The ID of the QAIHM model being tested
+            device: The targeted device
+            component: The name of the model component being tested, if applicable
+            fallback_to_universal_device: Return a job that ran with the universal device if a job
+                                        using the provided device is not available.
+        """
+        if x := self.job_id_mapping.get(
+            get_async_job_cache_name(
+                path,
+                model_id,
+                device.mirror_device or device,
+                component,
+            )
+        ):
+            return x
+
+        if fallback_to_universal_device:
+            return self.job_id_mapping.get(
+                get_async_job_cache_name(
+                    path,
+                    model_id,
+                    cs_universal,
+                    component,
+                )
+            )
+
+        return None
+
+    def set_job_id(
+        self,
+        job_id,
+        path: ScorecardPathTypeVar | TargetRuntime,
+        model_id: str,
+        device: ScorecardDevice,
+        component: Optional[str] = None,
+    ) -> None:
+        """
+        Set the key for this job in the YAML that stores asyncronously-ran scorecard jobs.
+
+        parameters:
+            job_id: Job ID to associate with the other parameters in the YAML
+            path: Applicable scorecard path
+            model_id: The ID of the QAIHM model being tested
+            device: The targeted device
+            component: The name of the model component being tested, if applicable
+        """
+        self.job_id_mapping[
+            get_async_job_cache_name(path, model_id, device, component)
+        ] = job_id
+
+    def update(self, other: ScorecardJobYaml):
+        """
+        Merge the other YAML into this YAML, overwriting any existing jobs with the same job name
+        """
+        if type(other) is not type(self):
+            raise ValueError(
+                f"Cannot merge scorecard YAMLS of types {type(other)} and {type(self)}"
+            )
+        self.job_id_mapping.update(other.job_id_mapping)
+
+    def get_job(
+        self,
+        path: ScorecardPathTypeVar,
+        model_id: str,
+        device: ScorecardDevice,
+        component: Optional[str] = None,
+    ) -> ScorecardJobTypeVar:
+        """
+        Get the scorecard job from the YAML associated with these parameters.
+
+        parameters:
+            path: Applicable scorecard path
+            model_id: The ID of the QAIHM model being tested
+            device: The targeted device
+            component: The name of the model component being tested, if applicable
+        """
+        return self.scorecard_job_type(
+            component or model_id,
+            self.get_job_id(
+                path, model_id, device, component, fallback_to_universal_device=True
+            ),
+            device,
+            True,
+            None,
+            path,  # type: ignore
+        )
+
+    def get_all_jobs(
+        self,
+        model_id: str,
+        is_quantized: bool,
+        components: Iterable[str] | None = None,
+    ) -> list[ScorecardJobTypeVar]:
+        """
+        Get all jobs in this YAML related to the provided model.
+        """
+        model_runs: list[ScorecardJobTypeVar] = []
+        for component in components or [None]:  # type: ignore
+
+            def create_job(path: ScorecardPathTypeVar, device: ScorecardDevice):
+                model_runs.append(
+                    self.get_job(path, model_id, device, component or None)
+                )
+
+            for_each_scorecard_path_and_device(
+                is_quantized,
+                self.__class__.scorecard_path_type,
+                create_job,
+                include_mirror_devices=True,
+            )
+
+        return model_runs
+
+    def summary_from_model(
+        self,
+        model_id: str,
+        is_quantized: bool,
+        components: Iterable[str] | None = None,
+    ) -> ModelSummaryTypeVar:
+        """
+        Creates a summary of all jobs related to the given model.
+        """
+        runs = self.get_all_jobs(model_id, is_quantized, components)
+        return self.scorecard_model_summary_type.from_runs(model_id, runs, components)  # type: ignore
+
+
+class CompileScorecardJobYaml(
+    ScorecardJobYaml[CompileScorecardJob, ScorecardCompilePath, ModelCompileSummary]
+):
+    scorecard_job_type = CompileScorecardJob
+    scorecard_path_type = ScorecardCompilePath
+    scorecard_model_summary_type = ModelCompileSummary
+
+
+class ProfileScorecardJobYaml(
+    ScorecardJobYaml[ProfileScorecardJob, ScorecardProfilePath, ModelPerfSummary]
+):
+    scorecard_job_type = ProfileScorecardJob
+    scorecard_path_type = ScorecardProfilePath
+    scorecard_model_summary_type = ModelPerfSummary
+
+
+class InferenceScorecardJobYaml(
+    ScorecardJobYaml[InferenceScorecardJob, ScorecardProfilePath, ModelInferenceSummary]
+):
+    scorecard_job_type = InferenceScorecardJob
+    scorecard_path_type = ScorecardProfilePath
+    scorecard_model_summary_type = ModelInferenceSummary

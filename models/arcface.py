@@ -16,8 +16,10 @@ class ArcFace:
         if session is None:
             self.session = onnxruntime.InferenceSession(
                 model_path,
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+                providers=["DmlExecutionProvider","CUDAExecutionProvider", "CPUExecutionProvider"],
             )
+        providers = self.session.get_providers()
+        print(f"ONNX Runtime is using the following provider: {providers[0]}")
         input_cfg = self.session.get_inputs()[0]
         input_shape = input_cfg.shape
 
